@@ -2,6 +2,7 @@ import re
 from datetime import datetime, date
 
 import requests
+import xmltodict
 
 
 __all__ = ('FioBank', 'ThrottlingError')
@@ -41,6 +42,7 @@ class FioBank(object):
         'last': 'last/{token}/transactions.json',
         'set-last-id': 'set-last-id/{token}/{from_id}/',
         'set-last-date': 'set-last-date/{token}/{from_date}/',
+        'import': "import/",
     }
 
     # http://www.fio.cz/xsd/IBSchema.xsd
@@ -82,17 +84,38 @@ class FioBank(object):
 
     def _request(self, action, **params):
         template = self.base_url + self.actions[action]
-        url = template.format(token=self.token, **params)
 
-        response = requests.get(url)
-        if response.status_code == requests.codes['conflict']:
-            raise ThrottlingError()
+        template = self.base_url + self.actions[action]
 
-        response.raise_for_status()
+        # Import method - goes via POST.
+        if "import" == action:
+            data = {"token": self.token}
+            files = {"file": params.pop("file_content")}
+            data.update(params)
 
-        if response.content:
-            return response.json()
-        return None
+            response = requests.post(template, data=data, files=files)
+            if response.status_code == requests.codes['conflict']:
+                raise ThrottlingError()
+            response.raise_for_status()
+
+            if response.text:
+                return response.text
+            return None
+
+        # Other methods - go via GET.
+        else:
+            url = template.format(token=self.token, **params)
+
+            response = requests.get(url)
+            if response.status_code == requests.codes['conflict']:
+                raise ThrottlingError()
+
+            response.raise_for_status()
+
+            if response.content:
+                return response.json()
+            return None
+
 
     def _parse_info(self, data):
         # parse data from API
@@ -147,6 +170,43 @@ class FioBank(object):
             # generate transaction data
             yield trans
 
+    def _parse_import_response(self, xml):
+
+        def parse_order(order):
+            """
+            Parses ID, code and message from order XML.
+            """
+
+            return {
+                "id": int(order["@id"]),
+                "code": int(order["messages"]["message"]["@errorCode"]),
+                "message": order["messages"]["message"]["#text"]
+            }
+
+        data = xmltodict.parse(xml.strip())
+        data = data["responseImport"]
+
+        # If request was errorfree, parse response.
+        if "0" == data["result"]["errorCode"]:
+            return {
+                "status": True,
+                "instruction_id": data["result"]["idInstruction"],
+                "sum": data["result"]["sums"]["sum"]["sumDebet"],
+            }
+
+        else:
+            details = []
+
+            # If orderDetails has more detail items, iterate thru them.
+            if isinstance(data["ordersDetails"]["detail"], list):
+                for o in data["ordersDetails"]["detail"]:
+                    details.append(parse_order(o))
+
+            else:
+                details.append(parse_order(data["ordersDetails"]["detail"]))
+
+            return {"status": False, "details": details}
+
     def _add_account_number_full(self, obj):
         account_number = obj.get('account_number')
         bank_code = obj.get('bank_code')
@@ -183,3 +243,38 @@ class FioBank(object):
             self._request('set-last-date', from_date=coerce_date(from_date))
 
         return self._parse_transactions(self._request('last'))
+
+    def send(self, type, language, filename, file_content):
+        """
+        Send = FIO "import" method (we cannot use "import" because it's Python keyword).
+        Sends file of "sending money requests" and returns dict.
+
+        In case of success:
+        {
+            "status": True,
+            "instruction_id": 123,
+            "sum": 1000
+        }
+
+        In case of failure:
+        {
+            "status": False,
+            "details": [
+                {
+                    "id" "1",
+                    "code" "16",
+                    "message": "Lorem ipsum...",
+                },
+                {
+                    "id" "2",
+                    "code" "16",
+                    "message": "Lorem ipsum...",
+                },
+                ...
+            ]
+        }
+        """
+
+        response = self._request("import", type=type, lng=language, filename=filename, file_content=file_content)
+
+        return self._parse_import_response(response)
