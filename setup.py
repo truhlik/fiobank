@@ -9,12 +9,11 @@ except ImportError:
     print(message, file=sys.stderr)
 
 
-version = '2.1.0'
+version = '3.0.0'
 
 
 install_requires = [
     'requests',
-    'xmltodict>=0.10.1',
 ]
 tests_require = [
     'pytest-runner',
